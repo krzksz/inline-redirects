@@ -57,7 +57,7 @@ HTTP/2 301 Moved Permanently
 Location: /en-us/products/boots
 Inline-Redirect: ?1
 Content-Type: text/html; charset=utf-8
-Cache-Control: private, max-age=0
+Cache-Control: private, max-age=3600
 Content-Security-Policy: default-src 'self'
 
 <!doctype html>...the document for /en-us/products/boots...
@@ -69,11 +69,11 @@ A client that does not know the response header sees an ordinary redirect and fo
 
 A server sends `Inline-Redirect: ?1` only when all of these hold:
 
-- `Location` resolves to a URL with the same origin as the request URL.
+- `Location` resolves to a URL with the same origin as the request URL, and differs from the request URL.
 - The content is what the server would return with status `200` for a `GET` of the `Location` URL, given the same request headers.
-- Apart from `Location` and `Inline-Redirect`, every response header is the one the server would send on that `200` response. The response carries no other headers that are meant for the redirect alone.
+- Apart from `Location`, `Inline-Redirect`, and HTTP caching headers (`Cache-Control`, `Expires`, `Age`), every response header is the one the server would send on that `200` response. The response carries no other headers that are meant for the redirect alone.
 
-A chain of same-origin redirects can be collapsed. The server sets `Location` to the final URL and sends that URL's document.
+A chain of same-origin redirects can be collapsed. The server sets `Location` to the final URL and sends that URL's document. Loop detection, hop limits, and timeouts for internal chain resolution are the server's responsibility. If the server detects a loop, exceeds its hop limit, or times out, it should fall back to returning a plain `3xx` without `Inline-Redirect` (letting the client apply its normal redirect limit) or return an appropriate `5xx` error.
 
 The server decides when to inline. A client that does not support the feature discards the content, so a wrong decision wastes bandwidth and server work and breaks nothing. A server can limit the waste by inlining only for browsers it knows support the feature, for example from the brand and version in `Sec-CH-UA`.
 
@@ -84,7 +84,7 @@ This proposal applies to `GET` document navigations: top-level, nested, and navi
 On a `301`, `302`, `303`, `307` or `308` response to such a navigation, the client treats the response as an inline redirect when all of these hold:
 
 1. The response carries `Inline-Redirect: ?1` and a valid `Location`.
-2. The `Location` URL has the same origin as the request's current URL.
+2. The `Location` URL has the same origin as the request's current URL, and is not equal to it.
 3. The response has content. A response that ends with no content is a normal redirect.
 4. Every check the client applies when it follows a redirect to the `Location` URL passes. This includes URL reputation checks, enterprise and extension URL rules, and the initiator's Content Security Policy. The client can start these checks when the response headers arrive and buffer the content until they finish.
 5. The cookies the client would send to the `Location` URL are the same set it sent on this request.
@@ -96,16 +96,16 @@ If all conditions hold, the client proceeds as if it had followed the redirect a
 
 - The response URL is the `Location` URL. The request's fragment carries over unless `Location` has one, as with any redirect.
 - The destination document's response status is `200`. The client still knows the status code it received and can use it for redirect caching and in developer tools.
-- All response headers apply to the destination document. There is no separate redirect response to which headers such as `Referrer-Policy`, `Cross-Origin-Opener-Policy` or `Set-Cookie` apply first. Defaults that depend on the response URL, such as a cookie's default path, use the `Location` URL.
+- Apart from `Location`, `Inline-Redirect`, and HTTP caching headers (`Cache-Control`, `Expires`, `Age`), all response headers apply to the destination document. There is no separate redirect response to which headers such as `Referrer-Policy`, `Cross-Origin-Opener-Policy` or `Set-Cookie` apply first. Defaults that depend on the response URL, such as a cookie's default path, use the `Location` URL.
 - The document's URL, base URL and origin, the address bar, and the session history entry are set from the `Location` URL before any content is parsed.
 - History behaves as for a normal redirect. The original URL does not get its own entry.
 
 ### Caching
 
-- The client may remember the redirect, based on the status code it received, as it does for a redirect without explicit freshness information. An example is heuristic caching of `301` and `308`. `Cache-Control` on an inline response describes the destination document and says nothing about the redirect.
-- If the client stores the response, it stores it as a `200` response for the `Location` URL, with the request headers it sent. It never stores it under the original URL.
+- The client caches the redirect as usual, based on the status code and the response's caching headers (`Cache-Control`, `Expires`, `Age`, or normal heuristics for `301` and `308` when no explicit freshness is present).
+- The client does not store the inline response body in its HTTP cache, under either URL. A later navigation to the `Location` URL fetches and caches it as usual.
 - The client uses an inline response even when it already holds a stored copy of the destination. The inline response is at least as fresh.
-- A cache that does not know this feature stores what it sees, a `3xx` with content under the original URL, with the freshness of the destination document. It may serve that response to any client. A client that does not support inline redirects follows `Location` and ignores the content, which costs bandwidth only.
+- A cache that does not know this feature stores what it sees, a `3xx` with content under the original URL, according to the `3xx`'s caching headers. Temporary redirects such as `302` are therefore not cached unless the server marks them cacheable. It may serve a stored response to any client; a client that does not support inline redirects follows `Location` and ignores the content, which costs bandwidth only. Servers behind an unaware shared cache that serve dynamic HTML should use `private` or `no-store` so the shared cache does not hold onto the attached body.
 - A shared cache that knows the feature should not store the inline response. It can produce one itself from its stored redirect and its stored copy of the destination.
 
 ### Timing and script-visible state
@@ -116,7 +116,7 @@ Navigation Timing reports the navigation as direct: `redirectCount` is 0, and `r
 
 ## Alternatives considered
 
-**`Content-Location`.** It already means "the URL of the enclosed representation". Fetch and HTML define no navigation behaviour for it, and some servers already emit it. A new field avoids changing the behaviour of existing responses.
+**`Content-Location`.** On a `200` response, RFC 9110 §8.7 explicitly states that `Content-Location` is representation metadata and not a replacement for the target URI. A `200` response also fails open: unaware browsers, crawlers, and HTTP clients stay on the original URL instead of redirecting. Existing sites already emit `Content-Location` on `200` navigations in ways that would break if browsers navigated to it. In the November 2026 HTTP Archive mobile crawl, 0.032% of HTML main documents carry `Content-Location` (94.5% with `Vary`), including internal portal state URLs, Apache `MultiViews` filenames (such as `index.html.en` or `*.php`), internal backend paths, and malformed relative hostnames. Using `Content-Location` equal to `Location` on a `3xx` response avoids those problems (0 occurrences in top-100k `3xx` responses), but duplicating the full URL introduces a mismatch edge case and leaves no room for Structured Field parameters.
 
 **A `200` response with a header that replaces the URL.** A client or crawler that does not know the header would treat the content as belonging to the original URL. Reusing `3xx` means every unaware party follows `Location`. The proposal is in effect this alternative with a status code that fails safely.
 
@@ -126,7 +126,7 @@ Navigation Timing reports the navigation as direct: `redirectCount` is 0, and `r
 
 **Internal rewrite with `history.replaceState()`.** The server returns the destination with `200` at the original URL, and script fixes the URL. The address bar, base URL, relative URL resolution, preload scanning and `Referer` all see the original URL until script runs, and clients without script never see the new one.
 
-**Internal rewrite with `rel=canonical`.** This addresses indexing only. The user stays on the old URL, and shares and bookmarks keep it alive.
+**Internal rewrite with `rel="canonical"`.** Whether sent via `<link rel="canonical">` or the `Link: rel="canonical"` HTTP header (RFC 8288), this addresses indexing only. Browsers do not update the address bar, `document.URL`, base URL, or history, and unaware non-browser clients do not redirect.
 
 **Speculation Rules and prefetch.** These help when the site controls the link and the browser predicts the click. They do not help the first navigation from another site.
 
@@ -138,7 +138,7 @@ Navigation Timing reports the navigation as direct: `redirectCount` is 0, and `r
 
 **Origin.** The destination must have the same origin as the request URL. A server can already put any content at any URL of its own origin, so an inline redirect gives it no new authority over URLs.
 
-**Shared-path origins.** Some origins host different parties under different paths. A party that controls responses for one path could use an inline redirect to show its content under another path's URL, and to store it in the client's cache for that URL. The first is already possible with `history.replaceState()`, since path is not a security boundary. The second is new: the cache entry persists after the user leaves. This proposal accepts it. HTTP/2 Server Push gave servers the same origin-wide authority over cache entries. If this is judged too much, the fallback is that clients do not store inline responses.
+**Shared-path origins.** Some origins host different parties under different paths. A party that controls responses for one path could use an inline redirect to show its content under another path's URL. That is already possible with `history.replaceState()`, since path is not a security boundary. Because clients do not store the inline body under the destination URL, nothing persists beyond a normal redirect.
 
 **Path-scoped state.** Cookies with a `Path` and service worker scopes can differ between the two URLs. Conditions 5 and 6 make the client fall back to a normal redirect in those cases, so the destination never renders with state it would not have had. The client does the cookie comparison because a server cannot see cookies it did not receive.
 
@@ -161,7 +161,7 @@ The proposal adds no request header and exposes nothing new about the client. Be
 - `303` after `POST`, so Post/Redirect/Get takes one roundtrip.
 - Subresources and `fetch()` with `redirect: "follow"`.
 - Destination responses other than `200`, carried as a parameter on `Inline-Redirect`.
-- A parameter that limits how long a client may remember the redirect.
+- Caching the inline response body under the `Location` URL.
 
 ## Standards venues
 
